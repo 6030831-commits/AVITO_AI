@@ -1,0 +1,6 @@
+httpx
+python-dotenv
+anthropic
+openpyxl
+openai
+Pillow

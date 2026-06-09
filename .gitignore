@@ -1,0 +1,23 @@
+# Secrets
+.env
+*.env
+.env.*
+
+# Generated infographics (re-run render.mjs to recreate)
+avito-ai-uslugi/prompts/listings/images/**/*.png
+
+# Node modules
+node_modules/
+**/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude internal
+.claude/
+
+# Firecrawl cache (large scraped HTML/JSON blobs)
+.firecrawl/competitor-research/listings/
+.firecrawl/competitor-research/brands/
+.firecrawl/content-factory/listings/

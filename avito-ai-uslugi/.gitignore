@@ -1,0 +1,9 @@
+.env
+*.key
+secrets/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.firecrawl/
+*.egg-info/

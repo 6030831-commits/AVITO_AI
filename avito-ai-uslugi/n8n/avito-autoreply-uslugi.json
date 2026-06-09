@@ -1,0 +1,485 @@
+{
+  "name": "Avito — автоответы по услугам ИИ-автоматизации (self-hosted, Claude API)",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "nodes": [
+    {
+      "id": "webhook-trigger",
+      "name": "Webhook: сообщение Avito",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1500, 300],
+      "notes": "URL этого узла = вебхук, который нужно подписать в кабинете Avito (messenger:read/write, x-avito-messenger-signature). Path ниже — пример, заменить на свой при импорте.",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "avito-messenger-uslugi",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      }
+    },
+    {
+      "id": "verify-signature",
+      "name": "Code: проверка подписи HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1260, 300],
+      "notes": "HMAC-SHA256(rawBody, AVITO_WEBHOOK_SECRET) в hex, сравнение через timing-safe compare с заголовком x-avito-messenger-signature. Тот же алгоритм, что в src/avito_uslugi/webhooks.py:verify_messenger_signature — если у владельца уже есть подтверждённый реальный алгоритм подписи Avito, поменять только этот узел.",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n\nconst secret = $env.AVITO_WEBHOOK_SECRET || '';\nconst rawBody = $input.first().binary?.data\n  ? Buffer.from($input.first().binary.data.data, 'base64')\n  : Buffer.from(JSON.stringify($input.first().json.body || {}), 'utf-8');\n\nconst headers = $input.first().json.headers || {};\nconst signatureHeader = (headers['x-avito-messenger-signature'] || '').toLowerCase();\n\nconst expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\n\nlet signatureValid = false;\ntry {\n  signatureValid = signatureHeader.length === expected.length &&\n    crypto.timingSafeEqual(Buffer.from(signatureHeader, 'utf-8'), Buffer.from(expected, 'utf-8'));\n} catch (e) {\n  signatureValid = false;\n}\n\nconst payload = ($input.first().json.body || {}).payload || {};\nconst value = payload.value || {};\n\nreturn [{\n  json: {\n    signatureValid,\n    chatId: value.chat_id,\n    userId: value.user_id,\n    authorId: value.author_id,\n    itemId: value.item_id,\n    messageText: value.content?.text || '',\n    messageType: value.type,\n    raw: $input.first().json.body\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "if-signature-valid",
+      "name": "If: подпись верна",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-1020, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.signatureValid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "respond-401",
+      "name": "Respond: 401 неверная подпись",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-780, 460],
+      "notes": "Сообщения с неверной подписью отбрасываем без обработки и без обращения к Claude — защита от подделки вебхука.",
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 401,
+        "responseBody": "={{ { \"ok\": false, \"error\": \"invalid_signature\" } }}"
+      }
+    },
+    {
+      "id": "skip-own-messages",
+      "name": "If: сообщение от клиента (не от нас)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-780, 220],
+      "notes": "Avito присылает вебхук и на исходящие сообщения тоже — фильтруем, чтобы бот не отвечал сам себе. authorId сравнивается с AVITO_USER_ID (id аккаунта владельца, из env).",
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ String($json.authorId) }}",
+              "rightValue": "={{ $env.AVITO_USER_ID }}",
+              "operator": { "type": "string", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "noop-own-message",
+      "name": "Respond: 200 (своё сообщение, пропускаем)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-540, 460],
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 200,
+        "responseBody": "={{ { \"ok\": true, \"skipped\": \"own_message\" } }}"
+      }
+    },
+    {
+      "id": "get-avito-token",
+      "name": "HTTP: токен Avito (client_credentials)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-540, 160],
+      "notes": "POST /token с client_id/client_secret из env n8n. В проде вместо повторного запроса на каждое сообщение лучше кешировать токен (Redis/n8n static data) — здесь для наглядности он получается каждый раз; OAuth2-обёртка с кэшем уже реализована в src/avito_uslugi/auth.py:TokenCache, при желании можно заменить эти HTTP-узлы вызовом своего сервиса.",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.avito.ru/token",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "grant_type", "value": "client_credentials" },
+            { "name": "client_id", "value": "={{ $env.AVITO_CLIENT_ID }}" },
+            { "name": "client_secret", "value": "={{ $env.AVITO_CLIENT_SECRET }}" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "get-chat-history",
+      "name": "HTTP: история чата (messenger:read)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-300, 160],
+      "notes": "GET /messenger/v3/accounts/{userId}/chats/{chatId}/messages/ — последние сообщения для контекста ответа. Требует scope messenger:read.",
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.avito.ru/messenger/v3/accounts/{{ $('Code: проверка подписи HMAC').item.json.userId }}/chats/{{ $('Code: проверка подписи HMAC').item.json.chatId }}/messages/",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "limit", "value": "30" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $json.access_token }}" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "get-item-info",
+      "name": "HTTP: карточка объявления",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-60, 160],
+      "notes": "GET /core/v1/accounts/{userId}/items/{itemId}/ — заголовок и текст объявления, по которому пишет клиент (контекст для ответа). Требует scope items:info.",
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.avito.ru/core/v1/accounts/{{ $('Code: проверка подписи HMAC').item.json.userId }}/items/{{ $('Code: проверка подписи HMAC').item.json.itemId }}/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('HTTP: токен Avito (client_credentials)').item.json.access_token }}" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "build-context",
+      "name": "Code: собрать контекст для Claude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [180, 160],
+      "notes": "Склеивает заголовок объявления, последние реплики чата (в хронологическом порядке, с пометкой кто писал) и текст последнего сообщения клиента — в один текстовый контекст для системного промпта client-comms.",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const sigData = $('Code: проверка подписи HMAC').first().json;\nconst item = $('HTTP: карточка объявления').first().json;\nconst history = $('HTTP: история чата (messenger:read)').first().json;\n\nconst messages = (history.messages || history.content?.messages || [])\n  .slice()\n  .reverse();\n\nconst transcript = messages.map(m => {\n  const who = String(m.author_id) === String(sigData.authorId) ? 'Клиент' : 'Я (владелец/бот)';\n  const text = m.content?.text || m.content?.message?.text || '';\n  return `${who}: ${text}`;\n}).join('\\n');\n\nconst context = [\n  `Объявление: ${item.title || '(без названия)'}`,\n  `Описание (фрагмент): ${(item.description || '').slice(0, 600)}`,\n  '',\n  'История диалога (последние сообщения, от старых к новым):',\n  transcript,\n  '',\n  `Новое сообщение клиента: ${sigData.messageText}`\n].join('\\n');\n\nreturn [{\n  json: {\n    ...sigData,\n    context,\n    lastClientMessage: sigData.messageText\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "claude-reply",
+      "name": "HTTP: Claude — ответ и escalate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [420, 160],
+      "notes": "Messages API, claude-sonnet-4-6. Системный промпт — роль из агента client-comms (тон практика, мягкая квалификация, без выдуманных цен/сроков). Просим вернуть строго JSON {reply, escalate, reason}. Для удешевления классификацию escalate можно вынести в отдельный узел на claude-haiku-4-5-20251001 (см. README рядом) — здесь для простоты обе задачи решает один вызов sonnet.",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"claude-sonnet-4-6\",\n  max_tokens: 700,\n  system: \"Ты отвечаешь от лица владельца действующего производства в Москве (с 2016 года, ЧПУ/дерево/металл/пластик), который сам строит и тестирует ИИ-автоматизацию на своём бизнесе и предлагает её другим. Тон — практик, не айтишник: конкретно, по делу, без маркетингового пафоса и без обещаний \\\"волшебной кнопки\\\".\\n\\nЗадачи: 1) поприветствовать и показать понимание сути запроса; 2) мягко квалифицировать — какая задача, объём (число процессов/заявок/документов в день или месяц), какие сервисы и данные уже используются, ориентир по бюджету/срокам; 3) дать честную первичную реакцию — реально ли автоматизировать и каким подходом (бот / n8n-пайплайн / распознавание документов / расчёты / сайт), без точных цены и сроков; 4) подвести к следующему шагу — описать задачу подробнее или прислать пример документа/процесса, владелец оценит и предложит вариант.\\n\\nЭскалируй (escalate=true), если клиент: описал конкретную задачу или прислал пример/ТЗ/объём; разговор движется к цене, срокам или заказу; явно просит созвон/встречу/КП. В этом случае reply должен мягко сообщать, что ты передал задачу владельцу и он вернётся с оценкой — НЕ называй цену и сроки сам.\\n\\nНе эскалируй на общие вопросы о направлениях работы и уточнения по процессу — отвечай сам по тексту объявления и контексту. Не выдумывай кейсы, цифры, цены и сроки сверх того, что есть в переданном контексте объявления.\\n\\nОтветь СТРОГО в формате JSON без markdown-обёртки: {\\\"reply\\\": \\\"текст ответа клиенту\\\", \\\"escalate\\\": true|false, \\\"reason\\\": \\\"короткое обоснование решения об эскалации\\\"}\",\n  messages: [\n    { role: \"user\", content: $json.context }\n  ]\n}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "parse-claude-reply",
+      "name": "Code: разобрать ответ Claude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 160],
+      "notes": "Достаёт JSON {reply, escalate, reason} из текстового content[0].text. При сбое парсинга — безопасный fallback: escalate=true (лучше лишний раз дёрнуть владельца, чем промолчать клиенту неправильно).",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const ctx = $('Code: собрать контекст для Claude').first().json;\nconst claude = $input.first().json;\nconst raw = (claude.content && claude.content[0] && claude.content[0].text) || '';\n\nlet parsed;\ntry {\n  const match = raw.match(/\\{[\\s\\S]*\\}/);\n  parsed = JSON.parse(match ? match[0] : raw);\n} catch (e) {\n  parsed = {\n    reply: 'Спасибо за сообщение! Передал задачу владельцу — он посмотрит и вернётся с ответом.',\n    escalate: true,\n    reason: 'fallback: не удалось разобрать ответ модели как JSON'\n  };\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    reply: parsed.reply,\n    escalate: !!parsed.escalate,\n    escalateReason: parsed.reason || ''\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "if-escalate",
+      "name": "If: требуется эскалация",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 160],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.escalate }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "send-escalation-reply",
+      "name": "HTTP: клиенту — «передал владельцу»",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 40],
+      "notes": "POST /messenger/v1/accounts/{userId}/chats/{chatId}/messages — текст reply из Claude (мягкое «передал, вернусь с оценкой»). Требует scope messenger:write.",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.avito.ru/messenger/v1/accounts/{{ $json.userId }}/chats/{{ $json.chatId }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('HTTP: токен Avito (client_credentials)').item.json.access_token }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message: { text: $json.reply }, type: \"text\" }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "notify-owner-telegram",
+      "name": "HTTP: Telegram — уведомление владельцу",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1380, 40],
+      "notes": "sendMessage в Telegram владельцу: текст клиента, причина эскалации и прямая ссылка на чат в кабинете Avito (messenger/v2/accounts/{userId}/chats/{chatId} в вебе кабинета). TELEGRAM_BOT_TOKEN и TELEGRAM_OWNER_CHAT_ID — из env n8n.",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  chat_id: $env.TELEGRAM_OWNER_CHAT_ID,\n  text: \"Эскалация по чату Avito\\n\\nПричина: \" + $json.escalateReason + \"\\n\\nСообщение клиента:\\n\" + $json.lastClientMessage + \"\\n\\nЧат: https://www.avito.ru/profile/messenger/channel/\" + $json.chatId,\n  disable_web_page_preview: true\n}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "send-normal-reply",
+      "name": "HTTP: клиенту — ответ Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 280],
+      "notes": "Обычный ответ без эскалации — текст reply из Claude отправляется напрямую клиенту. Требует scope messenger:write.",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.avito.ru/messenger/v1/accounts/{{ $json.userId }}/chats/{{ $json.chatId }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('HTTP: токен Avito (client_credentials)').item.json.access_token }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message: { text: $json.reply }, type: \"text\" }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "respond-200",
+      "name": "Respond: 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1620, 160],
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 200,
+        "responseBody": "={{ { \"ok\": true, \"escalated\": $json.escalate || false } }}"
+      }
+    },
+    {
+      "id": "followup-schedule",
+      "name": "Schedule: проверка молчащих чатов",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1500, 760],
+      "notes": "Отдельный, независимый от вебхука цикл follow-up. Периодичность — компромисс между «не быть навязчивым» и нагрузкой на API; по умолчанию раз в 2 часа, проверяет чаты, где клиент прочитал и молчит N часов (N задаётся в узле ниже).",
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "hours", "hoursInterval": 2 }
+          ]
+        }
+      }
+    },
+    {
+      "id": "followup-get-token",
+      "name": "HTTP: токен Avito (для follow-up)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-1260, 760],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.avito.ru/token",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "grant_type", "value": "client_credentials" },
+            { "name": "client_id", "value": "={{ $env.AVITO_CLIENT_ID }}" },
+            { "name": "client_secret", "value": "={{ $env.AVITO_CLIENT_SECRET }}" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "followup-get-chats",
+      "name": "HTTP: список чатов (непрочитанные исходящие)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-1020, 760],
+      "notes": "GET /messenger/v2/accounts/{userId}/chats — список активных чатов с временем последнего сообщения и его автором.",
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.avito.ru/messenger/v2/accounts/{{ $env.AVITO_USER_ID }}/chats",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $json.access_token }}" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "followup-filter",
+      "name": "Code: отобрать чаты для напоминания",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-780, 760],
+      "notes": "Условия отбора: последнее сообщение в чате — от владельца/бота (клиент прочитал и не ответил), молчание дольше FOLLOWUP_HOURS_THRESHOLD (по умолчанию 20 часов), и в static data воркфлоу ещё не отмечено, что напоминание по этому chat_id уже отправлялось — «не более одного напоминания на чат» из промпта 7.",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const THRESHOLD_HOURS = Number($env.FOLLOWUP_HOURS_THRESHOLD || 20);\nconst nowMs = Date.now();\n\nconst store = $getWorkflowStaticData('global');\nstore.remindedChats = store.remindedChats || {};\n\nconst chats = ($input.first().json.chats || []);\nconst userId = $env.AVITO_USER_ID;\n\nconst toRemind = chats.filter(chat => {\n  const last = chat.last_message || {};\n  const lastFromOwner = String(last.author_id) === String(userId);\n  const updatedMs = (chat.updated || 0) * 1000;\n  const hoursSilent = (nowMs - updatedMs) / (1000 * 60 * 60);\n  const alreadyReminded = !!store.remindedChats[chat.id];\n  return lastFromOwner && hoursSilent >= THRESHOLD_HOURS && !alreadyReminded;\n});\n\nreturn toRemind.map(chat => ({\n  json: {\n    chatId: chat.id,\n    userId\n  }\n}));\n"
+      }
+    },
+    {
+      "id": "followup-send",
+      "name": "HTTP: отправить напоминание клиенту",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-540, 760],
+      "notes": "Текст согласован с правилами client-comms: вежливо, без давления, не более одного напоминания. После отправки — пометить чат в static data, чтобы не напоминать повторно (следующий узел).",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.avito.ru/messenger/v1/accounts/{{ $json.userId }}/chats/{{ $json.chatId }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('HTTP: токен Avito (для follow-up)').item.json.access_token }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message: { text: \"Если ещё актуально — готов обсудить, опишите задачу в двух словах, и я подскажу, как к ней подступиться.\" }, type: \"text\" }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "followup-mark-sent",
+      "name": "Code: пометить напоминание отправленным",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-300, 760],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const store = $getWorkflowStaticData('global');\nstore.remindedChats = store.remindedChats || {};\nstore.remindedChats[$json.chatId] = Date.now();\nreturn [{ json: { chatId: $json.chatId, reminded: true } }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: сообщение Avito": {
+      "main": [[{ "node": "Code: проверка подписи HMAC", "type": "main", "index": 0 }]]
+    },
+    "Code: проверка подписи HMAC": {
+      "main": [[{ "node": "If: подпись верна", "type": "main", "index": 0 }]]
+    },
+    "If: подпись верна": {
+      "main": [
+        [{ "node": "If: сообщение от клиента (не от нас)", "type": "main", "index": 0 }],
+        [{ "node": "Respond: 401 неверная подпись", "type": "main", "index": 0 }]
+      ]
+    },
+    "If: сообщение от клиента (не от нас)": {
+      "main": [
+        [{ "node": "HTTP: токен Avito (client_credentials)", "type": "main", "index": 0 }],
+        [{ "node": "Respond: 200 (своё сообщение, пропускаем)", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: токен Avito (client_credentials)": {
+      "main": [[{ "node": "HTTP: история чата (messenger:read)", "type": "main", "index": 0 }]]
+    },
+    "HTTP: история чата (messenger:read)": {
+      "main": [[{ "node": "HTTP: карточка объявления", "type": "main", "index": 0 }]]
+    },
+    "HTTP: карточка объявления": {
+      "main": [[{ "node": "Code: собрать контекст для Claude", "type": "main", "index": 0 }]]
+    },
+    "Code: собрать контекст для Claude": {
+      "main": [[{ "node": "HTTP: Claude — ответ и escalate", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Claude — ответ и escalate": {
+      "main": [[{ "node": "Code: разобрать ответ Claude", "type": "main", "index": 0 }]]
+    },
+    "Code: разобрать ответ Claude": {
+      "main": [[{ "node": "If: требуется эскалация", "type": "main", "index": 0 }]]
+    },
+    "If: требуется эскалация": {
+      "main": [
+        [
+          { "node": "HTTP: клиенту — «передал владельцу»", "type": "main", "index": 0 },
+          { "node": "HTTP: Telegram — уведомление владельцу", "type": "main", "index": 0 }
+        ],
+        [{ "node": "HTTP: клиенту — ответ Claude", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: клиенту — «передал владельцу»": {
+      "main": [[{ "node": "Respond: 200 OK", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Telegram — уведомление владельцу": {
+      "main": [[{ "node": "Respond: 200 OK", "type": "main", "index": 0 }]]
+    },
+    "HTTP: клиенту — ответ Claude": {
+      "main": [[{ "node": "Respond: 200 OK", "type": "main", "index": 0 }]]
+    },
+    "Schedule: проверка молчащих чатов": {
+      "main": [[{ "node": "HTTP: токен Avito (для follow-up)", "type": "main", "index": 0 }]]
+    },
+    "HTTP: токен Avito (для follow-up)": {
+      "main": [[{ "node": "HTTP: список чатов (непрочитанные исходящие)", "type": "main", "index": 0 }]]
+    },
+    "HTTP: список чатов (непрочитанные исходящие)": {
+      "main": [[{ "node": "Code: отобрать чаты для напоминания", "type": "main", "index": 0 }]]
+    },
+    "Code: отобрать чаты для напоминания": {
+      "main": [[{ "node": "HTTP: отправить напоминание клиенту", "type": "main", "index": 0 }]]
+    },
+    "HTTP: отправить напоминание клиенту": {
+      "main": [[{ "node": "Code: пометить напоминание отправленным", "type": "main", "index": 0 }]]
+    }
+  }
+}

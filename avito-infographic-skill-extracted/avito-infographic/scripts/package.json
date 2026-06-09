@@ -1,0 +1,12 @@
+{
+  "name": "avito-infographic",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avito-uslugi"
+version = "0.1.0"
+description = "Обёртка Avito API и автоматизация публикации услуг ИИ-автоматизации"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "python-dotenv",
+    "anthropic",
+    "openpyxl",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
